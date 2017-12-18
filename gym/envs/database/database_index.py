@@ -8,6 +8,7 @@ import gym
 from gym import spaces
 from gym.utils import seeding
 import numpy as np
+import pandas as pd
 import psycopg2
 
 logger = logging.getLogger(__name__)
@@ -21,11 +22,12 @@ class DatabaseIndexEnv(gym.Env):
         self.user = user
         self.password = password
         self.port = port
+        self.closed = True
         self.conn = self.connect_db()
         # Target that we are optimizing for
         self.schema = schema
         self.table = table
-        self.columns = None
+        self.column_stats = None
 
         # Execution times to calculate reward
         self.initial_execution_time = None
@@ -54,12 +56,34 @@ class DatabaseIndexEnv(gym.Env):
             host=self.host,
             port=self.port,
         )
+        self.closed = self.conn.closed
 
     def determine_action_space(self):
         '''
-        Query table
+        Action space consists of every column in table
+        with each column having a boolean for whether to include it in the index
+        and a rank for sorting the order of the column (if included).
+
+        TODO: need to figure out how to handle when multiple columns are sampled
+        to have the same rank
         '''
-        self.action_space = spaces.Discrete(len(sql))
+        if self.closed: self.connect_db()
+
+        self.column_stats = pd.read_sql('''
+            SELECT *
+              FROM pg_stats
+             WHERE schemaname = '{schema}'
+               AND tablename = '{table}'
+        '''.format(schema=self.schema, table=self.table), self.conn)
+
+        assert self.column_stats.attname.is_unique, 'columns are not unique'
+
+        self.action_space = spaces.Dict({
+            colname: spaces.Dict({
+                'is_included': spaces.Discrete(2),
+                'rank': spaces.Box(low=0, high=1, shape=(1,)).sample()
+            }) for colname in self.column_stats.attname
+        })
 
 
     def determine_observation_space(self):
