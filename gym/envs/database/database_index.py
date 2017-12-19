@@ -49,6 +49,7 @@ class DatabaseIndexEnv(gym.Env):
         self.steps_beyond_done = None
 
     def connect_db(self):
+        # TODO: replace with raise NotImplementedError
         self.conn = psycopg2.connect(
             database=self.database,
             user=self.user,
@@ -81,16 +82,49 @@ class DatabaseIndexEnv(gym.Env):
         self.action_space = spaces.Dict({
             colname: spaces.Dict({
                 'is_included': spaces.Discrete(2),
-                'rank': spaces.Box(low=0, high=1, shape=(1,)).sample()
+                'rank': spaces.Box(low=0, high=1, shape=(1,))
             }) for colname in self.column_stats.attname
         })
 
+    def create_index(self, action):
+        '''
+        Convert action to SQL
+
+        Each column has a boolean flag indicating whether it should be
+        used in the index and a rank variable that is used for
+        determining their order in the index
+        '''
+        included_cols = []
+        for col, col_action in sorted(action.iteritems(),
+                                      key=lambda (c,a): a['rank'],
+                                      reverse=True):
+            if col_action['is_included'] == 1:
+                included_cols.append('"{}"'.format(col))
+        stmt = 'CREATE INDEX ON {schema}.{table} ({cols})'.format(cols=', '.join(included_cols),
+                                                                  schema=self.schema,
+                                                                  table=self.table)
+        self.conn.cursor().execute(stmt)
+
+    def query_indexes(self):
+        '''
+        Query indexes on the target table
+
+        Useful for seeing cumulative actions and
+        for checking whether rollback worked
+        '''
+        return pd.read_sql('''
+            SELECT *
+              FROM pg_indexes
+             WHERE schemaname = '{schema}'
+               AND tablename = '{table}'
+        '''.format(schema=self.schema, table=self.table))
 
     def determine_observation_space(self):
         '''
 
         '''
-        return spaces.Box(low=0, high=, shape=(1,))
+        return spaces.Box(low=, high=,
+            shape=(len(self.queries), self.column_stats.attname.shape[0]))
 
     def _seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -131,16 +165,11 @@ class DatabaseIndexEnv(gym.Env):
 
         return np.array(self.state), reward, done, {}
 
-    def rollback(self):
-        '''
-        Undo all changes made by model
-        '''
-        pass
-
     def _reset(self):
         self.state = self.np_random.uniform(low=-0.05, high=0.05, size=(4,))
         self.steps_beyond_done = None
-        self.rollback()
+        # Undo all changes made by model
+        self.conn.rollback()
         return np.array(self.state)
 
     def _render(self, mode='human', close=False):
