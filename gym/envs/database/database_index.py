@@ -121,10 +121,76 @@ class DatabaseIndexEnv(gym.Env):
 
     def determine_observation_space(self):
         '''
+        Observation space consists of one row per query with the following information:
+        - for each column, what is its cardinality? (unchanging wrt to query and action)
+        - for each column, what was the cost associated with it in the query?
+        - how many steps were involved in the query?
+        '''
+        ncol = self.column_stats.attname.shape[0]
+        nquery = len(self.queries)
+        obs_shape = (nquery, 1 + (ncol * 2))
+        return spaces.Box(
+            low=np.zeros(obs_shape),
+            high=np.array([np.inf] * obs_shape[0] * obs_shape[1]).reshape(obs_shape)
+        )
+
+    def get_cardinality(self):
+        '''
+        Returns a pandas dataframe with columns attname (aka colname) and n_distinct
+        '''
+        colstat = self.column_stats[['attname', 'n_distinct']]
+        if colstat.n_distinct.min() < 0:
+            # n_distinct is negative if Postgres believes the cardinality is proportional to row_count
+            # Replace negative n_distinct values with approximation of actual cardinality
+            plan = self.explain("SELECT * FROM {schema}.{table}".format(schema=self.schema, table=self.table))
+            nrow = plan['Plan']['Plan Rows']
+            replacement = colstat.n_distinct * nrow * -1
+            colstat['n_distinct'] = replacement.where(colstat.n_distinct < 0, other=colstat.n_distinct)
+            assert colstat.n_distinct.min() >= 0
+        return colstat
+
+    def get_column_cost(self, query):
+        '''
+        Return column presence in the query plan. If found, attribute the
+        Total Cost - Startup Cost to this column.
 
         '''
-        return spaces.Box(low=, high=,
-            shape=(len(self.queries), self.column_stats.attname.shape[0]))
+        columns = pd.DataFrame(self.column_stats.attname)
+        columns['cost'] = 0
+        for col in columns.attname:
+            plan = self.explain(query)
+
+    def preprocess_query_plan(plan):
+        '''
+        The query plan is a nested dictionary which is hard to work with.
+        Flatten the nest into a table of nodes with relevant information
+        '''
+        flat = [plan['Plan']]
+        def flatten_plan(nodes):
+            '''
+            Move all the nested nodes so they are at the same level
+            '''
+            for node in nodes:
+                if 'Plans' in node:
+                    plans = node.pop('Plans')
+                    flat.append(node)
+                    flatten_plan(plans)
+                else:
+                    flat.append(node)
+        flatten_plan(flat)
+        flat_df = pd.DataFrame(flat)
+        # The incremental cost introduced by a given node
+        flat_df['Node Cost'] = flat_df['Total Cost'] - flat_df['Startup Cost']
+        return flat_df
+
+    def explain(self, query):
+        '''
+        Return the results of a SQL EXPLAIN query as a dict
+        '''
+        cur = self.conn.cursor()
+        stmt = 'EXPLAIN (FORMAT JSON) ' + query
+        cur.execute(stmt)
+        return cur.fetchone()[0][0]
 
     def _seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
