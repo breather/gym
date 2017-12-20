@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 class DatabaseIndexEnv(gym.Env):
 
-    def __init__(self, database, host, user, password, port, table, schema):
+    def __init__(self, database, host, user, password, port, table, schema, queries):
         # Database connection setup
         self.database = database
         self.host = host
@@ -28,16 +28,14 @@ class DatabaseIndexEnv(gym.Env):
         self.schema = schema
         self.table = table
         self.column_stats = None
+        # Optimize table on these queries
+        self.queries = queries
 
         # Execution times to calculate reward
         self.initial_execution_time = None
         self.previous_execution_time = None
 
-        # Optimize table on these queries
-        self.queries = []
-        self.query_plans = []  # TODO: optimize based on query plans
-
-        self.action_space = None
+        self.action_space = self.determine_action_space()
         self.observation_space = self.determine_observation_space()
 
         # Remember previous actions taken for rollback and also more efficient searches
@@ -153,14 +151,20 @@ class DatabaseIndexEnv(gym.Env):
         '''
         Return column presence in the query plan. If found, attribute the
         Total Cost - Startup Cost to this column.
-
         '''
+        plan = self.explain(query)
+        flat = self.preprocess_query_plan(plan)
         columns = pd.DataFrame(self.column_stats.attname)
         columns['cost'] = 0
         for col in columns.attname:
-            plan = self.explain(query)
+            isin_filter = flat['Filter'].str.contains(col).fillna(False)
+            isin_index = flat['Index Cond'].str.contains(col).fillna(False)
+            indicator = isin_filter | isin_index
+            if indicator.any():
+                columns.loc[columns['attname'] == col, 'cost'] = flat[indicator]['Node Cost'].sum()
+        return columns
 
-    def preprocess_query_plan(plan):
+    def preprocess_query_plan(self, plan):
         '''
         The query plan is a nested dictionary which is hard to work with.
         Flatten the nest into a table of nodes with relevant information
@@ -181,6 +185,8 @@ class DatabaseIndexEnv(gym.Env):
         flat_df = pd.DataFrame(flat)
         # The incremental cost introduced by a given node
         flat_df['Node Cost'] = flat_df['Total Cost'] - flat_df['Startup Cost']
+        # Remove nodes that did not involve filtering on a column
+        flat_df[~(flat_df['Filter'].isnull() & flat_df['Index Cond'].isnull())]
         return flat_df
 
     def explain(self, query):
@@ -191,6 +197,21 @@ class DatabaseIndexEnv(gym.Env):
         stmt = 'EXPLAIN (FORMAT JSON) ' + query
         cur.execute(stmt)
         return cur.fetchone()[0][0]
+
+    def set_queries(self, queries):
+        '''
+        queries is a DataFrame containing queries and their frequency
+        '''
+        assert 'query' in queries.columns
+        assert 'frequency' in queries.columns
+        self.queries = queries
+
+    def set_initial_state(self):
+        assert self.queries is not None, 'must set_queries'
+        cardinality = self.get_cardinality()
+        for query in self.queries['query']:
+            column_cost = self.get_column_cost(query)
+            query_cost = self.explain(query)['Plan']['Total Cost']
 
     def _seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -232,10 +253,10 @@ class DatabaseIndexEnv(gym.Env):
         return np.array(self.state), reward, done, {}
 
     def _reset(self):
-        self.state = self.np_random.uniform(low=-0.05, high=0.05, size=(4,))
-        self.steps_beyond_done = None
         # Undo all changes made by model
         self.conn.rollback()
+        self.state = self.initial_state
+        self.steps_beyond_done = None
         return np.array(self.state)
 
     def _render(self, mode='human', close=False):
