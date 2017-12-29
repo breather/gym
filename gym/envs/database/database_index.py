@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 import psycopg2
 
+from keras.preprocessing.sequence import pad_sequences
+
 logger = logging.getLogger(__name__)
 
 class DatabaseIndexEnv(gym.Env):
@@ -109,8 +111,13 @@ class DatabaseIndexEnv(gym.Env):
         used in the index and a rank variable that is used for
         determining their order in the index
         '''
-        self.column_cost['is_included'] = action[0]
-        self.column_cost['rank'] = action[1]
+        padded_action = pad_sequences(action,
+                                      maxlen=self.column_cost.shape[0],
+                                      padding='post',
+                                      truncating='post',
+                                      dtype='float64')
+        self.column_cost['is_included'] = padded_action[0]
+        self.column_cost['rank'] = padded_action[1]
 
         included_cols = self.column_cost \
             .sort('rank', ascending=False) \
@@ -236,25 +243,35 @@ class DatabaseIndexEnv(gym.Env):
     def _step(self, action):
         print 'step start'
         assert self.action_space.contains(action), "%r (%s) invalid"%(action, type(action))
-        state = self.state
 
-        current_query_record = self.queries.loc[self.current_index]
-        query, schema, table, frequency = self.parse_query_record(current_query_record)
+        if self.steps_beyond_done is None:
+            current_query_record = self.queries.loc[self.current_index]
+            query, schema, table, frequency = self.parse_query_record(current_query_record)
 
-        previous_cost = self.previous_cost  # cost before action
-        self.create_index(action, schema, table)  # action
-        cost_after = self.get_query_cost(query)  # cost after action
+            previous_cost = self.previous_cost  # cost before action
+            self.create_index(action, schema, table)  # action
+            cost_after = self.get_query_cost(query)  # cost after action
 
-        complexity_penalty = 0  # unnecessary if you run test over insert queries as well
-        reward = previous_cost - cost_after - complexity_penalty
+            complexity_penalty = 0  # unnecessary if you run test over insert queries as well
+            reward = previous_cost - cost_after - complexity_penalty
 
-        self.current_index += 1
-        next_query_record = self.queries.loc[self.current_index]
-        self.set_state(next_query_record)
+            self.current_index += 1
+            done = self.current_index == self.queries.shape[0]
+            if not done:
+                next_query_record = self.queries.loc[self.current_index]
+                self.set_state(next_query_record)
+            else:
+                self.state = np.zeros_like(self.state)
+                self.steps_beyond_done = 0
+        else:
+            if self.steps_beyond_done == 0:
+                logger.warning("You are calling 'step()' even though this environment has already returned done = True. You should always call 'reset()' once you receive 'done = True' -- any further steps are undefined behavior.")
+            self.steps_beyond_done += 1
+            self.state = np.zeros_like(self.state)
+            reward = 0.0
+            done = True
 
-        done = self.current_index == self.queries.shape[0]
-
-        return np.array(self.state), reward, done, {}
+        return self.state, reward, done, {}
 
     def _reset(self):
         print 'reset'
@@ -265,7 +282,7 @@ class DatabaseIndexEnv(gym.Env):
         first_query_record = self.queries.loc[self.current_index]
         self.set_state(first_query_record)
         self.steps_beyond_done = None
-        return np.array(self.state)
+        return self.state
 
     def set_state(self, query_record):
         '''
@@ -276,9 +293,18 @@ class DatabaseIndexEnv(gym.Env):
         self.get_column_cost(schema, table, query)
         self.previous_cost = self.get_query_cost(query)
 
-        self.state = column_cost \
-            [['n_distinct', 'cost']] \
-            .head(32)
+        values = []
+        for col in ['n_distinct', 'cost']:
+            values.append(self.column_cost[col].tolist())
+        # No matter the table, state will always be the same shape
+        padded_vals = pad_sequences(values,
+            maxlen=32,
+            padding='post',
+            truncating='post',
+            dtype='float64')
+        # Include additional features, such as query frequency
+        state = np.append(padded_vals.flatten(), frequency)
+        self.state = state
 
     def parse_query_record(self, query_record):
         query = query_record['query']
