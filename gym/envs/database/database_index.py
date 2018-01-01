@@ -18,66 +18,41 @@ logger = logging.getLogger(__name__)
 
 class DatabaseIndexEnv(gym.Env):
 
-    def __init__(self, database, host, user, password, port, table, schema, queries):
+    def __init__(self):
         # Database connection setup
-        self.database = database
-        self.host = host
-        self.user = user
-        self.password = password
-        self.port = port
-        self.closed = True
-        self.conn = self.connect_db()
+        self.conn = None
         # Optimize table on these queries
         # DataFrame w/ following columns: query, schema, table, frequency, priority
         # frequency and priority might end up as features in the state
-        self.queries = queries
+        self.queries = None
         self.current_index = 0
         # contains various statistics stored by the database on its tables
         self.column_stats = None
         self.table_rows = None
-        self.get_stats()
 
         # Execution times to calculate reward
         self.previous_cost = None
 
-        self.action_space = self.determine_action_space()
-        self.observation_space = self.determine_observation_space()
-
-        # Remember previous actions taken for rollback and also more efficient searches
-        self.actions_taken = []
+        self.action_space = spaces.Tuple((
+            spaces.MultiBinary(32),
+            spaces.Box(low=0, high=1, shape=(32,))
+        ))
+        self.observation_space = spaces.Box(low=0, high=np.inf, shape=(2*32+1,))
 
         self._seed()
         self.state = None
 
         self.steps_beyond_done = None
 
-    def connect_db(self):
+    def connect_db(self, database, host, user, password, port):
         # TODO: replace with raise NotImplementedError
         self.conn = psycopg2.connect(
-            database=self.database,
-            user=self.user,
-            password=self.password,
-            host=self.host,
-            port=self.port,
+            database=database,
+            user=user,
+            password=password,
+            host=host,
+            port=port,
         )
-        self.closed = self.conn.closed
-
-    def determine_action_space(self):
-        '''
-        Action space consists of up to 32 columns with a binary flag to indicate
-        if the column should be included in the index or not and a continuous
-        rank to indicate what order the columns should be in the index.
-
-        If a table has more than 32 columns, select the ones with highest cardinality
-        for the action space.
-
-        TODO: need to figure out how to handle when multiple columns are sampled
-        to have the same rank
-        '''
-        self.action_space = spaces.Tuple((
-            spaces.MultiBinary(32),
-            spaces.Box(low=0, high=1, shape=(32,))
-        ))
 
     def get_stats(self):
         tables = self.queries['table'].unique()
@@ -98,8 +73,8 @@ class DatabaseIndexEnv(gym.Env):
                AND pg_stats.tablename = pg_stat_user_tables.relname
              WHERE pg_stats.schemaname IN ({schemas})
                AND pg_stats.tablename IN ({tables})
-        '''.format(schemas=','.join("'{0}}'".format(s) for s in schemas),
-                   tables=','.join("'{0}'".format(t) for t in table)),
+        '''.format(schemas=','.join("'{0}'".format(s) for s in schemas),
+                   tables=','.join("'{0}'".format(t) for t in tables)),
             self.conn)
         self.table_rows = self.column_stats[['schemaname', 'tablename', 'n_row']].drop_duplicates()
 
@@ -127,38 +102,24 @@ class DatabaseIndexEnv(gym.Env):
             stmt = 'CREATE INDEX ON {schema}.{table} ({cols})'.format(cols=', '.join(included_cols),
                                                                       schema=schema,
                                                                       table=table)
+            print 'Running.... ' + stmt
             self.conn.cursor().execute(stmt)
+            return stmt
 
-    def query_indexes(self):
+    def query_indexes(self, query_record):
         '''
         Query indexes on the target table
 
         Useful for seeing cumulative actions and
         for checking whether rollback worked
         '''
+        query, schema, table, frequency = self.parse_query_record(query_record)
         return pd.read_sql('''
             SELECT *
               FROM pg_indexes
              WHERE schemaname = '{schema}'
                AND tablename = '{table}'
-        '''.format(schema=self.schema, table=self.table))
-
-    def determine_observation_space(self):
-        '''
-        Observation space consists of one row per query with the following information:
-        - for each column, what is its cardinality? (unchanging wrt to query and action)
-        - for each column, what was the cost associated with it in the query?
-        - how many steps were involved in the query?
-
-        # TODO: modify to work on a single query (Probably a Tuple this time)
-        '''
-        ncol = self.column_stats.colname.shape[0]
-        nquery = len(self.queries)
-        obs_shape = (nquery, 1 + (ncol * 2))
-        return spaces.Box(
-            low=np.zeros(obs_shape),
-            high=np.array([np.inf] * obs_shape[0] * obs_shape[1]).reshape(obs_shape)
-        )
+        '''.format(schema=schema, table=table), self.conn)
 
     def get_cardinality(self):
         '''
@@ -182,8 +143,8 @@ class DatabaseIndexEnv(gym.Env):
         '''
         plan = self.explain(query)
         flat = self.preprocess_query_plan(plan)
-        columns = self.column_stats.loc[self.column_stats['schemaname'] == schema &
-                                            self.column_stats['tablename'] == table,
+        columns = self.column_stats.loc[(self.column_stats['schemaname'] == schema).values &
+                                            (self.column_stats['tablename'] == table).values,
                                         ['colname', 'n_distinct']]
         columns['cost'] = 0
         for col in columns.colname:
@@ -207,17 +168,21 @@ class DatabaseIndexEnv(gym.Env):
             for node in nodes:
                 if 'Plans' in node:
                     plans = node.pop('Plans')
-                    flat.append(node)
+                    flat.append(plans[0])
                     flatten_plan(plans)
-                else:
-                    flat.append(node)
         flatten_plan(flat)
         flat_df = pd.DataFrame(flat)
         # The incremental cost introduced by a given node
         flat_df['Node Cost'] = flat_df['Total Cost'] - flat_df['Startup Cost']
         # Remove nodes that did not involve filtering on a column
-        flat_df[~(flat_df['Filter'].isnull() & flat_df['Index Cond'].isnull())]
-        return flat_df
+        # TODO: consider including 'Sort Key'
+        for col in ['Filter', 'Index Cond']:
+            if not col in flat_df.columns:
+                flat_df[col] = None
+        return flat_df[~(
+            flat_df['Filter'].isnull() &
+            flat_df['Index Cond'].isnull()
+        )]
 
     def explain(self, query):
         '''
@@ -235,6 +200,7 @@ class DatabaseIndexEnv(gym.Env):
         assert 'query' in queries.columns
         assert 'frequency' in queries.columns
         self.queries = queries
+        self.get_stats()
 
     def _seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -249,11 +215,11 @@ class DatabaseIndexEnv(gym.Env):
             query, schema, table, frequency = self.parse_query_record(current_query_record)
 
             previous_cost = self.previous_cost  # cost before action
-            self.create_index(action, schema, table)  # action
+            index_stmt = self.create_index(action, schema, table)  # action
             cost_after = self.get_query_cost(query)  # cost after action
 
             complexity_penalty = 0  # unnecessary if you run test over insert queries as well
-            reward = previous_cost - cost_after - complexity_penalty
+            reward = frequency * (previous_cost - cost_after - complexity_penalty)
 
             self.current_index += 1
             done = self.current_index == self.queries.shape[0]
@@ -271,7 +237,7 @@ class DatabaseIndexEnv(gym.Env):
             reward = 0.0
             done = True
 
-        return self.state, reward, done, {}
+        return self.state, reward, done, {'indexdef': index_stmt}
 
     def _reset(self):
         print 'reset'
