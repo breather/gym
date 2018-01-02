@@ -5,6 +5,7 @@ TODO: modify to work on a single query at a time (for transfer learning)
 
 import logging
 import math
+import sys
 import gym
 from gym import spaces
 from gym.utils import seeding
@@ -33,10 +34,9 @@ class DatabaseIndexEnv(gym.Env):
         # Execution times to calculate reward
         self.previous_cost = None
 
-        self.action_space = spaces.Tuple((
-            spaces.MultiBinary(32),
-            spaces.Box(low=0, high=1, shape=(32,))
-        ))
+        # 0 indicates the column should not be included
+        # non-zero values are sorted to indicate the column order in the index
+        self.action_space = spaces.Box(low=0, high=1, shape=(32,))
         self.observation_space = spaces.Box(low=0, high=np.inf, shape=(2*32+1,))
 
         self._seed()
@@ -86,17 +86,16 @@ class DatabaseIndexEnv(gym.Env):
         used in the index and a rank variable that is used for
         determining their order in the index
         '''
-        padded_action = pad_sequences(action,
+        padded_action = pad_sequences([action],
                                       maxlen=self.column_cost.shape[0],
                                       padding='post',
                                       truncating='post',
                                       dtype='float64')
-        self.column_cost['is_included'] = padded_action[0]
-        self.column_cost['rank'] = padded_action[1]
+        self.column_cost['rank'] = padded_action[0]
 
         included_cols = self.column_cost \
             .sort('rank', ascending=False) \
-            .loc[self.column_cost['is_included'] == 1, 'colname']
+            .loc[self.column_cost['rank'] > 0, 'colname']
 
         if len(included_cols) > 0:
             stmt = 'CREATE INDEX ON {schema}.{table} ({cols})'.format(cols=', '.join(included_cols),
@@ -153,7 +152,7 @@ class DatabaseIndexEnv(gym.Env):
             indicator = isin_filter | isin_index
             if indicator.any():
                 columns.loc[columns['colname'] == col, 'cost'] = flat[indicator]['Node Cost'].sum()
-        self.column_cost = columns.sort('n_distinct', ascending=False)
+        self.column_cost = columns.sort(['n_distinct', 'cost'], ascending=False)
 
     def preprocess_query_plan(self, plan):
         '''
@@ -207,8 +206,9 @@ class DatabaseIndexEnv(gym.Env):
         return [seed]
 
     def _step(self, action):
-        print 'step start'
+        action = np.clip(action, 0, 1)
         assert self.action_space.contains(action), "%r (%s) invalid"%(action, type(action))
+        index_stmt, previous_cost, cost_after = (None, None, None)
 
         if self.steps_beyond_done is None:
             current_query_record = self.queries.loc[self.current_index]
@@ -218,7 +218,7 @@ class DatabaseIndexEnv(gym.Env):
             index_stmt = self.create_index(action, schema, table)  # action
             cost_after = self.get_query_cost(query)  # cost after action
 
-            complexity_penalty = 0  # unnecessary if you run test over insert queries as well
+            complexity_penalty = 0  # might be unnecessary if you run over insert queries as well
             reward = frequency * (previous_cost - cost_after - complexity_penalty)
 
             self.current_index += 1
@@ -237,7 +237,11 @@ class DatabaseIndexEnv(gym.Env):
             reward = 0.0
             done = True
 
-        return self.state, reward, done, {'indexdef': index_stmt}
+        return self.state, reward, done, {
+            'indexdef': index_stmt,
+            'previous_cost': previous_cost,
+            'cost_after': cost_after
+        }
 
     def _reset(self):
         print 'reset'
