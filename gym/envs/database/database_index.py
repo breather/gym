@@ -1,6 +1,6 @@
 """
 Set indices for a database table to better handle the queries performed against it
-TODO: modify to work on a single query at a time (for transfer learning)
+TODO: support multiple connections for parallelization
 """
 
 import logging
@@ -26,7 +26,9 @@ class DatabaseIndexEnv(gym.Env):
         # DataFrame w/ following columns: query, schema, table, frequency, priority
         # frequency and priority might end up as features in the state
         self.queries = None
-        self.current_index = 0
+        self.current_index = None
+        self.queries_init = None  # used when resetting
+        self.tables_done = None  # Track when each table is considered done
         # contains various statistics stored by the database on its tables
         self.column_stats = None
         self.table_rows = None
@@ -34,10 +36,10 @@ class DatabaseIndexEnv(gym.Env):
         # Execution times to calculate reward
         self.previous_cost = None
 
-        # 0 indicates the column should not be included
-        # non-zero values are sorted to indicate the column order in the index
-        self.action_space = spaces.Box(low=0, high=1, shape=(32,))
-        self.observation_space = spaces.Box(low=0, high=np.inf, shape=(2*32+1,))
+        # < 0 indicates the column should not be included
+        # > 0 values are sorted to indicate the column order in the index
+        self.action_space = spaces.Box(low=-1, high=1, shape=(32,))
+        self.observation_space = spaces.Box(low=0, high=np.inf, shape=(2*32+2,))
 
         self._seed()
         self.state = None
@@ -62,10 +64,12 @@ class DatabaseIndexEnv(gym.Env):
                  , pg_stats.tablename
                  , pg_stats.attname AS colname
                  , CASE
-                   WHEN pg_stats.n_distinct >= 0 THEN pg_stats.n_distinct
-                   -- otherwise n_distinct is the negative proportion of cardinality
-                   ELSE -1 * pg_stats.n_distinct * pg_stat_user_tables.n_live_tup
-                    END AS n_distinct
+                   WHEN pg_stats.n_distinct >= 0
+                   -- convert to cardinality ratio
+                   THEN pg_stats.n_distinct * 1.0 / pg_stat_user_tables.n_live_tup
+                   -- otherwise n_distinct is already the negative proportion of cardinality
+                   ELSE -1 * pg_stats.n_distinct
+                    END AS cardinality_ratio
                  , pg_stat_user_tables.n_live_tup AS n_row
               FROM pg_stats
               JOIN pg_stat_user_tables
@@ -104,6 +108,8 @@ class DatabaseIndexEnv(gym.Env):
             print 'Running.... ' + stmt
             self.conn.cursor().execute(stmt)
             return stmt
+        else:
+            return 'Did not create index (NOOP)'
 
     def query_indexes(self, query_record):
         '''
@@ -120,21 +126,6 @@ class DatabaseIndexEnv(gym.Env):
                AND tablename = '{table}'
         '''.format(schema=schema, table=table), self.conn)
 
-    def get_cardinality(self):
-        '''
-        Returns a pandas dataframe with columns colname (aka colname) and n_distinct
-        '''
-        colstat = self.column_stats[['colname', 'n_distinct']]
-        if colstat.n_distinct.min() < 0:
-            # n_distinct is negative if Postgres believes the cardinality is proportional to row_count
-            # Replace negative n_distinct values with approximation of actual cardinality
-            plan = self.explain("SELECT * FROM {schema}.{table}".format(schema=self.schema, table=self.table))
-            nrow = plan['Plan']['Plan Rows']
-            replacement = colstat.n_distinct * nrow * -1
-            colstat['n_distinct'] = replacement.where(colstat.n_distinct < 0, other=colstat.n_distinct)
-            assert colstat.n_distinct.min() >= 0
-        return colstat
-
     def get_column_cost(self, schema, table, query):
         '''
         Return column presence in the query plan. If found, attribute the
@@ -144,7 +135,7 @@ class DatabaseIndexEnv(gym.Env):
         flat = self.preprocess_query_plan(plan)
         columns = self.column_stats.loc[(self.column_stats['schemaname'] == schema).values &
                                             (self.column_stats['tablename'] == table).values,
-                                        ['colname', 'n_distinct']]
+                                        ['colname', 'cardinality_ratio']]
         columns['cost'] = 0
         for col in columns.colname:
             isin_filter = flat['Filter'].str.contains(col).fillna(False)
@@ -152,7 +143,7 @@ class DatabaseIndexEnv(gym.Env):
             indicator = isin_filter | isin_index
             if indicator.any():
                 columns.loc[columns['colname'] == col, 'cost'] = flat[indicator]['Node Cost'].sum()
-        self.column_cost = columns.sort(['n_distinct', 'cost'], ascending=False)
+        self.column_cost = columns.sort(['cardinality_ratio', 'cost'], ascending=False)
 
     def preprocess_query_plan(self, plan):
         '''
@@ -199,7 +190,9 @@ class DatabaseIndexEnv(gym.Env):
         assert 'query' in queries.columns
         assert 'frequency' in queries.columns
         self.queries = queries
+        self.queries_init = queries
         self.get_stats()
+        self.set_tables_done()
 
     def _seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -211,20 +204,32 @@ class DatabaseIndexEnv(gym.Env):
         index_stmt, previous_cost, cost_after = (None, None, None)
 
         if self.steps_beyond_done is None:
-            current_query_record = self.queries.loc[self.current_index]
+            current_query_record = self.queries[self.queries.index == self.current_index]
             query, schema, table, frequency = self.parse_query_record(current_query_record)
 
             previous_cost = self.previous_cost  # cost before action
             index_stmt = self.create_index(action, schema, table)  # action
             cost_after = self.get_query_cost(query)  # cost after action
 
-            complexity_penalty = 0  # might be unnecessary if you run over insert queries as well
+            # Creating indices comes with a cost and multi-column indices should be penalized more
+            complexity_penalty = np.sum(action > 0) * 30000.0  # parameter to tweak
             reward = frequency * (previous_cost - cost_after - complexity_penalty)
 
-            self.current_index += 1
-            done = self.current_index == self.queries.shape[0]
+            # Update whether the table is considered done
+            self.tables_done.loc[(self.tables_done.schema == schema) &
+                            (self.tables_done.table == table),
+                        'done'] = np.sum(action <= 0) == len(action)  # Done when no index is created
+            # Remove queries for a table when it is done
+            if self.tables_done.loc[(self.tables_done.schema == schema) &
+                                    (self.tables_done.table == table),
+                                    'done'].all():
+                self.queries = self.queries.loc[(self.queries.schema != schema) &
+                                                (self.queries.table != table)]
+            # Actually done if all tables are considered done
+            done = self.tables_done.done.all()
             if not done:
-                next_query_record = self.queries.loc[self.current_index]
+                next_query_record = self.queries.sample(n=1)
+                self.current_index = next_query_record.index.values[0]
                 self.set_state(next_query_record)
             else:
                 self.state = np.zeros_like(self.state)
@@ -247,9 +252,9 @@ class DatabaseIndexEnv(gym.Env):
         print 'reset'
         # Undo all changes made by model
         self.conn.rollback()
-        self.random_sort_queries()
-        self.current_index = 0
-        first_query_record = self.queries.loc[self.current_index]
+        self.queries = self.queries_init
+        first_query_record = self.queries.sample(n=1)
+        self.current_index = first_query_record.index.values[0]
         self.set_state(first_query_record)
         self.steps_beyond_done = None
         return self.state
@@ -264,7 +269,7 @@ class DatabaseIndexEnv(gym.Env):
         self.previous_cost = self.get_query_cost(query)
 
         values = []
-        for col in ['n_distinct', 'cost']:
+        for col in ['cardinality_ratio', 'cost']:
             values.append(self.column_cost[col].tolist())
         # No matter the table, state will always be the same shape
         padded_vals = pad_sequences(values,
@@ -272,15 +277,15 @@ class DatabaseIndexEnv(gym.Env):
             padding='post',
             truncating='post',
             dtype='float64')
-        # Include additional features, such as query frequency
-        state = np.append(padded_vals.flatten(), frequency)
+        # Include additional features, such as query frequency and number of table rows
+        state = np.append(padded_vals.flatten(), [frequency, self.column_stats.n_row.max()])
         self.state = state
 
     def parse_query_record(self, query_record):
-        query = query_record['query']
-        schema = query_record['schema']
-        table = query_record['table']
-        frequency = query_record['frequency']
+        query = query_record['query'].values[0]
+        schema = query_record['schema'].values[0]
+        table = query_record['table'].values[0]
+        frequency = query_record['frequency'].values[0]
         return (query, schema, table, frequency)
 
     def _render(self, mode='human', close=False):
@@ -294,3 +299,7 @@ class DatabaseIndexEnv(gym.Env):
         Re-order queries so the model does not fit on it
         '''
         self.queries = self.queries.sample(frac=1).reset_index(drop=True)
+
+    def set_tables_done(self):
+        self.tables_done = self.queries[['schema', 'table']].drop_duplicates()
+        self.tables_done['done'] = False
